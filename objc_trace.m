@@ -7,7 +7,9 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <stdlib.h>
 #include <mach/mach.h>
+#include <pthread.h>
 
 __attribute__((naked))
 id objc_msgSend_trace(id self, SEL op) {
@@ -52,7 +54,55 @@ id objc_msgSend_trace(id self, SEL op) {
     );
 }
 
-void* original_msgSend;
+__attribute__((naked))
+id mach_msg_trace(id self, SEL op) {
+    __asm__ __volatile__ (
+        "stp fp, lr, [sp, #-16]!;\n"
+        "mov fp, sp;\n"
+
+        /**
+        * Store the value of all the parameter registers (x0-x8, q0-q7) so we can
+        * restore everything to the initial state at the time of the actual function
+        * call
+        */
+        "sub    sp, sp, #(10*8 + 8*16);\n"
+        "stp    q0, q1, [sp, #(0*16)];\n"
+        "stp    q2, q3, [sp, #(2*16)];\n"
+        "stp    q4, q5, [sp, #(4*16)];\n"
+        "stp    q6, q7, [sp, #(6*16)];\n"
+        "stp    x0, x1, [sp, #(8*16+0*8)];\n"
+        "stp    x2, x3, [sp, #(8*16+2*8)];\n"
+        "stp    x4, x5, [sp, #(8*16+4*8)];\n"
+        "stp    x6, x7, [sp, #(8*16+6*8)];\n"
+        "str    x8,     [sp, #(8*16+8*8)];\n"
+
+        "BL _hook_mach_msg_pre;\n"
+        "mov x9, x0;\n"
+
+        // Restore all the parameter registers to the initial state.
+        "ldp    q0, q1, [sp, #(0*16)];\n"
+        "ldp    q2, q3, [sp, #(2*16)];\n"
+        "ldp    q4, q5, [sp, #(4*16)];\n"
+        "ldp    q6, q7, [sp, #(6*16)];\n"
+        "ldp    x0, x1, [sp, #(8*16+0*8)];\n"
+        "ldp    x2, x3, [sp, #(8*16+2*8)];\n"
+        "ldp    x4, x5, [sp, #(8*16+4*8)];\n"
+        "ldp    x6, x7, [sp, #(8*16+6*8)];\n"
+        "ldr    x8,     [sp, #(8*16+8*8)];\n"
+        
+        "BLR x9;\n" // call the original
+        "BL _hook_mach_msg_post;\n"
+
+        // Restore the stack pointer, frame pointer and link register
+        "mov    sp, fp;\n"
+        "ldp    fp, lr, [sp], #16;\n"
+               
+        "RET;\n"
+    );
+}
+
+void* original_msgSend = NULL;
+void* original_mach_msg = NULL;
 FILE* output = NULL;
 
 void* getParam(int num, void* a1, void* a2, void* a3, void* a4, void* a5) {
@@ -67,8 +117,41 @@ void* getParam(int num, void* a1, void* a2, void* a3, void* a4, void* a5) {
     return NULL;
 }
 
+void* hook_mach_msg_post(void* a1) {
+    // TODO: make stateful to get the response message.
+    mach_port_t machTID = pthread_mach_thread_np(pthread_self());
+
+    fprintf(output, "{\"tid\":%d, \"return\":\"0x%016X\"}\n", machTID, a1);
+
+    return a1;
+}
+
+void* hook_mach_msg_pre(mach_msg_header_t*            msg,
+                     mach_msg_option_t             option,
+                     mach_msg_size_t            send_size,
+                     mach_msg_size_t        receive_limit,
+                     mach_port_t             receive_name,
+                     mach_msg_timeout_t           timeout,
+                     mach_port_t                   notify) {
+
+    mach_port_t machTID = pthread_mach_thread_np(pthread_self());
+
+    char* byt_str = (char*)msg;
+
+    fprintf(output, "{\"msg\":\"");
+    for(int i = 0; i < send_size; ++i) {
+        fprintf(output, "%02X", *byt_str);
+
+        byt_str++;
+    }
+
+    fprintf(output, "\", \"msg_option\":\"0x%016X\", \"notify\":%d, \"rcv_name\":%d, \"recv_msg_size\":%d, \"send_msg_size\":%d, \"timeout\":%d, \"tid\":%d}\n", option, notify, receive_name, receive_limit, send_size, timeout, machTID);
+
+    return original_mach_msg;
+}
+
 void* hook_callback64_pre(id self, SEL op, void* a1, void* a2, void* a3, void* a4, void* a5) {
-    // get the important bits: class, function
+    // get the important bits: class, method
     char* classname = (char*) object_getClassName( self );
     if(classname == NULL) {
         classname = "nil";
@@ -321,6 +404,7 @@ __attribute__((constructor))
 static void init_hook(int argc, const char **argv) {
     output = stderr;
 
+    // objc_msgSend
     void* p_objc_msgSend = dlsym( RTLD_DEFAULT , "objc_msgSend" );
 
     if(p_objc_msgSend != NULL){
@@ -330,11 +414,27 @@ static void init_hook(int argc, const char **argv) {
     } else {
         fprintf(output, "Failed to find objc_msgSend address");
     }
+
+
+    // mach_msg
+    void* p_mach_msg = dlsym( RTLD_DEFAULT , "mach_msg" );
+
+    if(p_mach_msg != NULL){
+        original_mach_msg = hook_function(p_mach_msg, mach_msg_trace);
+
+        fprintf(output, "mach_msg function substrated from %p to %p, trampoline %p\n", p_mach_msg, mach_msg_trace, original_mach_msg);
+    } else {
+        fprintf(output, "Failed to find mach_msg address");
+    }
 }
 
 __attribute__((destructor))
 void clean_hook() {
     if(original_msgSend != NULL){
         unhook_function(original_msgSend);
+    }
+
+    if(original_mach_msg != NULL){
+        unhook_function(original_mach_msg);
     }
 }
