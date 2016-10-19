@@ -117,11 +117,71 @@ void* getParam(int num, void* a1, void* a2, void* a3, void* a4, void* a5) {
     return NULL;
 }
 
+typedef struct {
+    int                in_use;
+    mach_port_t        machTID;
+    mach_msg_header_t* msg;
+    mach_msg_size_t    receive_limit;
+} thread_state;
+
+#define NUM_STATES 1024
+thread_state msg_states[NUM_STATES];
+pthread_mutex_t states_lock;
+
+thread_state* allocate_state(mach_port_t machTID) {
+    for(int i = 0; i < NUM_STATES; i++) {
+        if(msg_states[i].in_use == 0) {
+            msg_states[i].in_use = 1;
+            msg_states[i].machTID = machTID;
+
+            return &(msg_states[i]);
+        }
+    }
+
+    // no more states, why are there so many threads?!
+    return NULL;
+}
+
+void deallocate_state(thread_state* state) {
+    state->in_use = 0;
+}
+
+thread_state* find_state(mach_port_t machTID) {
+    for(int i = 0; i < NUM_STATES; i++) {
+        if(msg_states[i].in_use != 0 && msg_states[i].machTID == machTID) {
+            return &(msg_states[i]);
+        }
+    }
+
+    // not found
+    return NULL;
+}
+
 void* hook_mach_msg_post(void* a1) {
-    // TODO: make stateful to get the response message.
+    thread_state* state = NULL;
     mach_port_t machTID = pthread_mach_thread_np(pthread_self());
 
-    fprintf(output, "{\"tid\":%d, \"return\":\"0x%016X\"}\n", machTID, a1);
+    pthread_mutex_lock(&states_lock);
+    state = find_state(machTID);
+    pthread_mutex_unlock(&states_lock);
+
+    fprintf(output, "{\"tid\":%d, \"return\":\"0x%016X\", \"resp_msg\":\"", machTID, a1);
+
+    if(state != NULL) {
+        char* byt_str = (char*)state->msg;
+
+        for(int i = 0; i < state->receive_limit; ++i) {
+            fprintf(output, "%02X", *byt_str);
+
+            byt_str++;
+        }
+
+        deallocate_state(state);
+    } else {
+        fprintf(output, "no state");
+    }
+
+    fprintf(output, "\"}\n");
 
     return a1;
 }
@@ -135,6 +195,16 @@ void* hook_mach_msg_pre(mach_msg_header_t*            msg,
                      mach_port_t                   notify) {
 
     mach_port_t machTID = pthread_mach_thread_np(pthread_self());
+    thread_state* state = NULL;
+
+    pthread_mutex_lock(&states_lock);
+    state = allocate_state(machTID);
+    pthread_mutex_unlock(&states_lock);
+
+    if(state != NULL) {
+        state->msg = msg;
+        state->receive_limit = receive_limit;
+    }
 
     char* byt_str = (char*)msg;
 
@@ -402,10 +472,16 @@ void* unhook_function(void* _jump_page) {
 // Work like an injected library.
 __attribute__((constructor))
 static void init_hook(int argc, const char **argv) {
+    // initialize
+    pthread_mutex_init(&states_lock, NULL);
     output = stderr;
 
+    for(int i = i; i < NUM_STATES; i++) {
+        msg_states[i].in_use = 0;
+    }
+
     // objc_msgSend
-    void* p_objc_msgSend = dlsym( RTLD_DEFAULT , "objc_msgSend" );
+    /*void* p_objc_msgSend = dlsym( RTLD_DEFAULT , "objc_msgSend" );
 
     if(p_objc_msgSend != NULL){
         original_msgSend = hook_function(p_objc_msgSend, objc_msgSend_trace);
@@ -413,7 +489,7 @@ static void init_hook(int argc, const char **argv) {
         fprintf(output, "objc_msgSend function substrated from %p to %p, trampoline %p\n", p_objc_msgSend, objc_msgSend_trace, original_msgSend);
     } else {
         fprintf(output, "Failed to find objc_msgSend address");
-    }
+    }*/
 
 
     // mach_msg
