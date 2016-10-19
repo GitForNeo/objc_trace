@@ -10,6 +10,12 @@
 #include <stdlib.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <mach-o/dyld_images.h>
+#include <mach/vm_map.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/fat.h>
 
 __attribute__((naked))
 id objc_msgSend_trace(id self, SEL op) {
@@ -163,9 +169,8 @@ void* hook_mach_msg_post(void* a1) {
 
     pthread_mutex_lock(&states_lock);
     state = find_state(machTID);
-    pthread_mutex_unlock(&states_lock);
 
-    fprintf(output, "{\"tid\":%d, \"return\":\"0x%016X\", \"resp_msg\":\"", machTID, a1);
+    fprintf(output, "MACH: {\"tid\":%d, \"return\":\"0x%016X\", \"resp_msg\":\"", machTID, a1);
 
     if(state != NULL) {
         char* byt_str = (char*)state->msg;
@@ -183,6 +188,8 @@ void* hook_mach_msg_post(void* a1) {
 
     fprintf(output, "\"}\n");
 
+    pthread_mutex_unlock(&states_lock);
+
     return a1;
 }
 
@@ -199,7 +206,6 @@ void* hook_mach_msg_pre(mach_msg_header_t*            msg,
 
     pthread_mutex_lock(&states_lock);
     state = allocate_state(machTID);
-    pthread_mutex_unlock(&states_lock);
 
     if(state != NULL) {
         state->msg = msg;
@@ -208,7 +214,7 @@ void* hook_mach_msg_pre(mach_msg_header_t*            msg,
 
     char* byt_str = (char*)msg;
 
-    fprintf(output, "{\"msg\":\"");
+    fprintf(output, "MACH: {\"msg\":\"");
     for(int i = 0; i < send_size; ++i) {
         fprintf(output, "%02X", *byt_str);
 
@@ -217,38 +223,59 @@ void* hook_mach_msg_pre(mach_msg_header_t*            msg,
 
     fprintf(output, "\", \"msg_option\":\"0x%016X\", \"notify\":%d, \"rcv_name\":%d, \"recv_msg_size\":%d, \"send_msg_size\":%d, \"timeout\":%d, \"tid\":%d}\n", option, notify, receive_name, receive_limit, send_size, timeout, machTID);
 
+    pthread_mutex_unlock(&states_lock);
+
     return original_mach_msg;
 }
+
+typedef IMP (*p_cache_getImp)(Class cls, SEL sel);
+p_cache_getImp c_cache_getImp = NULL;
 
 void* hook_callback64_pre(id self, SEL op, void* a1, void* a2, void* a3, void* a4, void* a5) {
     // get the important bits: class, method
     char* classname = (char*) object_getClassName( self );
-    if(classname == NULL) {
-        classname = "nil";
-    }
-    
-    char* opname = (char*) op;
-    int namelen = strlen(opname);
-    int classlen = strlen(classname);
-    
-    if(classlen > 1024) {
-        // something is wrong, we really shouldn't have such long names
-        goto bail;
-    }
-    
-    // print some useful info.
-    fprintf(output, "%016x: [%s %s (", pthread_self(), classname, (char*)opname);
+    Class cls = object_getClass(self);
 
-    int printParam = 0;
-    for(int i = 0; i < namelen; i++) {
-        if(opname[i] == ':') {
-            printParam += 1;
-        
-            fprintf(output, "%p ", getParam(printParam, a1, a2, a3, a4, a5));
+    IMP cacheImp = NULL;
+
+    if(cls != NULL && op != NULL) {
+        cacheImp = c_cache_getImp(cls, op);
+    }
+
+    if(!cacheImp) {
+        // not in cache, never been called, record the call.
+
+        if(classname == NULL) {
+            classname = "nil";
         }
-    }
+        
+        char* opname = (char*) op;
+        int namelen = strlen(opname);
+        int classlen = strlen(classname);
+        
+        if(classlen > 1024) {
+            // something is wrong, we really shouldn't have such long names
+            goto bail;
+        }
+        
+        pthread_mutex_lock(&states_lock);
 
-    fprintf(output, ")]\n");
+        // print some useful info.
+        fprintf(output, "OBJC: %016x: [%s %s (", pthread_self(), classname, (char*)opname);
+
+        int printParam = 0;
+        for(int i = 0; i < namelen; i++) {
+            if(opname[i] == ':') {
+                printParam += 1;
+            
+                fprintf(output, "%p ", getParam(printParam, a1, a2, a3, a4, a5));
+            }
+        }
+
+        fprintf(output, ")]\n");
+
+        pthread_mutex_unlock(&states_lock);
+    }
 
    bail:
     return original_msgSend;
@@ -469,27 +496,36 @@ void* unhook_function(void* _jump_page) {
     munmap(_jump_page, 4096);
 }
 
+const struct mach_header* libobjc_dylib_base();
+uint64_t findSymbol64(uint8_t* buffer, const int size, char* symbol, const int symsize);
+
 // Work like an injected library.
 __attribute__((constructor))
 static void init_hook(int argc, const char **argv) {
-    // initialize
-    pthread_mutex_init(&states_lock, NULL);
+    sleep(10);
+
     output = stderr;
+
+    const struct mach_header* libobjc_base = libobjc_dylib_base();
+    // static offset because symlook up was broken, would be nice to fix :)
+    c_cache_getImp = (p_cache_getImp)((uint8_t*)libobjc_base) + 97792 + 0x4000;
+
+    pthread_mutex_init(&states_lock, NULL);
 
     for(int i = i; i < NUM_STATES; i++) {
         msg_states[i].in_use = 0;
     }
 
     // objc_msgSend
-    /*void* p_objc_msgSend = dlsym( RTLD_DEFAULT , "objc_msgSend" );
+    void* p_objc_msgSend = dlsym( RTLD_DEFAULT , "objc_msgSend" );
 
     if(p_objc_msgSend != NULL){
         original_msgSend = hook_function(p_objc_msgSend, objc_msgSend_trace);
 
         fprintf(output, "objc_msgSend function substrated from %p to %p, trampoline %p\n", p_objc_msgSend, objc_msgSend_trace, original_msgSend);
     } else {
-        fprintf(output, "Failed to find objc_msgSend address");
-    }*/
+        fprintf(output, "Failed to find objc_msgSend address\n");
+    }
 
 
     // mach_msg
@@ -513,4 +549,112 @@ void clean_hook() {
     if(original_mach_msg != NULL){
         unhook_function(original_mach_msg);
     }
+}
+
+
+// poor man's dlsym function, used to locate dlsym and dyld::loadFromMemory on /usr/lib/dyld.
+//  this version of the procedure looks for 64bit symbols.
+uint64_t findSymbol64(uint8_t* buffer, const int size, char* symbol, const int symsize) {
+    // does not appear to be working with ios cached libraries unfortunately.
+
+    // We assume that our target has a FAT file for dyld. Since we are targeting
+    //  OSX/iOS, they will have dyld for 32/64 bit architectures in one file.
+    int offset = 0;
+
+    #if 0
+    struct fat_header* fatheader = (struct fat_header*)buffer;
+    struct fat_arch* archs = (struct fat_arch*)(buffer + sizeof(struct fat_header));
+
+    // Iterate the FAT file architecture, looking for the architecture we want.
+    for(int i = 0; i < fatheader->nfat_arch; ++i) {
+        struct fat_arch* arch = &archs[i];
+        struct mach_header_64* hdr = (struct mach_header_64*)(buffer + OSSwapBigToHostInt32(arch->offset));
+
+        // Once we have found the 64-bit version, we assume this is the one we want.
+        if(hdr->magic == MH_MAGIC_64) {
+            // Fix up the buffer to allow the rest of the procedure to work on the 
+            //  mach-o file.
+            buffer = hdr;
+            break;
+        }
+    }
+    #endif
+
+    // top of the Mach-o file is the header structure.
+    struct mach_header_64* header = (struct mach_header_64*)buffer;
+
+    // The structure must have a magic value that will match the 64bit architecture.
+    if(header->magic != MH_MAGIC_64) {
+        return -1;      
+    }
+
+    // we will need to skip the header.
+    offset = sizeof(struct mach_header_64);
+
+    // get the number of commands available in the header of the Mach-o.
+    int ncmds = header->ncmds;
+
+    // Iterate through all commands.
+    while(ncmds--) {
+        struct load_command * lcp = (struct load_command *)(buffer + offset);
+        offset += lcp->cmdsize;
+
+        // we are only interested in the symbol table command because it will enable us
+        //  to find the symbol we are interested in.
+        if(lcp->cmd == LC_SYMTAB) {
+            struct symtab_command *symtab = (struct symtab_command *)lcp;
+
+            // obtain the begining of the symbol table.
+            struct nlist_64 *ns = (struct nlist_64 *)(buffer + symtab->symoff);
+            char *strtable = buffer + symtab->stroff;
+
+            // iterate through all symbol names.
+            for (int j = 0; j < symtab->nsyms; ++j) {
+                char* checkName = strtable + ns[j].n_un.n_strx;
+                int isMatch = 1;
+
+                // this is out custom strncmp which will look for the match.
+                for(int i = 0; i < symsize && checkName[i] != '\0'; ++i) {
+                    if(symbol[i] != checkName[i]) {
+                        isMatch = 0;
+                        break;
+                    }
+                }
+
+                // Once matched we make sure that this isn't just a starts with match.
+                if(isMatch && (checkName[symsize] == '\0')) {
+                    // if it is a full match then return the address of the symbol.
+                    return ns[j].n_value;
+                }
+            }
+        }
+    }
+
+    // return zero if the symbol was not found.
+    return 0;
+}
+
+
+//http://stackoverflow.com/a/33898317
+
+const struct mach_header* libobjc_dylib_base() {
+    struct task_dyld_info dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+
+    if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t) &dyld_info, &count) == KERN_SUCCESS) {
+        struct dyld_all_image_infos* infos = (struct dyld_all_image_infos *) dyld_info.all_image_info_addr;
+        struct dyld_image_info* info = (struct dyld_image_info*) infos->infoArray;
+
+        for (int i=0; i < infos->infoArrayCount; i++) {
+            if(strcmp(info[i].imageFilePath, "/usr/lib/libobjc.A.dylib") == 0) {
+                printf("path: %p %s\n", info[i].imageLoadAddress, info[i].imageFilePath);
+
+                return info[i].imageLoadAddress;
+            }
+        }
+    } else {
+        printf("Not success!\n");
+    }
+
+    return 0;
 }
